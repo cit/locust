@@ -1,0 +1,263 @@
+defmodule Simulator do
+  @moduledoc """
+  Documentation for Dhtsim.
+  """
+
+  require Logger
+
+  use Application
+
+  alias MlDHT.Server.Utils, as: Utils
+
+  #######################
+  # Constans and Config #
+  #######################
+
+  @name __MODULE__
+
+  # INFO Settings
+  @cfg %{
+    churn_start_kill_enabled:  false,
+    number_of_malicious_nodes: 0,
+    number_of_benign_nodes:    [10, 500, 1000, 5000],
+    experiment_name:           "memory-footprint-15min-10-5000",
+    data_dir:                  "../../data",
+    node_list:                 [],
+    delay_measurement:         60 * 1000 * 15,
+    local_ip_addr:             {127, 0, 0, 1}
+  }
+
+  ####################
+  # Public Interface #
+  ####################
+
+  def start(_type, _args), do: Simulator.start_link()
+
+  def start_link, do: GenServer.start_link(__MODULE__, [], name: @name)
+
+  def start_simulation, do: GenServer.cast(@name, :start_simulation)
+
+  def info, do: GenServer.cast(@name, :info)
+
+  #####################
+  # Private Interface #
+  #####################
+
+  def init([]) do
+    MlDHT.Registry.start()
+
+    filename = generate_filename(@cfg.data_dir, @cfg.experiment_name)
+    Simulator.Benchmark.create_file(filename)
+
+    ## Start timer for churn start and kill
+    if @cfg.churn_start_kill_enabled do
+      Process.send_after(self(), :churn_kill,  60 * 1000)
+      Process.send_after(self(), :churn_start, 2 * 60 * 1000)
+    end
+
+    ## Check which remote nodes are active
+    Enum.each(@cfg.node_list, fn node -> Node.ping(node) end)
+
+    Process.send_after(self(), :save_memory_info,  @cfg.delay_measurement)
+
+    {:ok, %{
+        sup_pid:         nil,
+        filename:        filename,
+        benign_nodes:    [],
+        malicious_nodes: [],
+        beam_node_list:  Node.list(),
+        current_exp:     0,
+        experiments:     @cfg.number_of_benign_nodes,
+        benchmark_init:  Simulator.Benchmark.new()
+     }}
+  end
+
+  def stop(state) do
+    Logger.error "#{inspect state}"
+    :ok
+  end
+
+
+  def handle_info(:save_memory_info, state) do
+    old_entry = state.benchmark_init    |> Map.from_struct()
+    new_entry = Simulator.Benchmark.new |> Map.from_struct()
+
+    entry_merge = old_entry |> Map.merge(new_entry, fn _k, v1, v2 -> v2 - v1 end)
+    foo = Kernel.struct(%Simulator.Benchmark{}, entry_merge)
+
+    state.filename
+    |> Simulator.Benchmark.append_entry(%Simulator.Benchmark{foo | nr_nodes: state.current_exp})
+
+    Process.send_after(self(), :save_memory_info,  @cfg.delay_measurement)
+    DynamicSupervisor.stop(state.sup_pid)
+
+    Logger.error "Foo: #{inspect state.experiments}"
+
+    if state.experiments == [] do
+      # cfg_str = :erlang.term_to_binary(@cfg)
+      cfg_str = inspect(@cfg)
+
+      {:ok, file} = state.filename
+      |> String.replace_trailing(".csv", "-config.txt")
+      |> File.open([:write])
+
+      IO.write(file, cfg_str)
+      File.close(file)
+
+      System.halt(0)
+    else
+      Simulator.start_simulation()
+    end
+
+    {:noreply, state}
+  end
+
+  def handle_info({:DOWN, _ref, :process, _, _}, state) do
+    Logger.error("Node DOWN")
+
+    {:noreply, state}
+  end
+
+  def handle_info(:churn_kill, state) do
+    {pid, node_id} = state.benign_nodes |> Enum.random()
+    node_id_enc = node_id |> Base.encode16()
+
+    Logger.error("[churn] kill: #{inspect node_id_enc}")
+
+    Process.exit(pid, :kill)
+    Process.send_after(self(), :churn_kill, 60 * 1000)
+
+    {:noreply, state}
+  end
+
+  def handle_info(:churn_start, state) do
+    ## Generate a new node ID
+    node_id     = Utils.gen_node_id()
+    node_id_enc = node_id |> Base.encode16()
+
+    Logger.error "[churn] start: #{node_id_enc}"
+
+    # Start the main supervisor for the dht node
+    {:ok, pid} = DynamicSupervisor.start_child(Simulator.Supervisor,
+      {MlDHT.Supervisor,
+       node_id: node_id,
+       name:    MlDHT.Registry.via(node_id_enc, MlDHT.Supervisor)
+      })
+
+    Process.send_after(self(), :churn_start, 60 * 1000)
+
+    {:noreply, %{ state | :benign_nodes => state.benign_nodes ++ [{pid, node_id}] }}
+  end
+
+  def handle_cast(:start_simulation, state) do
+    {:ok, sup_pid} = Simulator.Supervisor.start_link([])
+
+    bs_node_id     = Utils.gen_node_id()
+    bs_node_id_enc = bs_node_id |> Base.encode16()
+    Logger.error "Bootstraping Server: #{inspect bs_node_id_enc}"
+
+    Application.put_env(:mldht, :port, 1111)
+
+    {:ok, _bs_pid} = DynamicSupervisor.start_child(sup_pid,
+      {MlDHT.Supervisor,
+       node_id: bs_node_id,
+       delay:   0,
+       name:    MlDHT.Registry.via(bs_node_id_enc, MlDHT.Supervisor)
+      })
+
+    bs_node = [{bs_node_id_enc, @cfg.local_ip_addr, 1111}]
+    Application.put_env(:mldht, :port, 0)
+    Application.put_env(:mldht, :bootstrap_nodes, bs_node)
+
+    [current | rest] = state.experiments
+
+    Logger.error "Start with #{current} nodes"
+
+    {:noreply, %{state |
+                 :sup_pid         => sup_pid,
+                 :current_exp     => current,
+                 :experiments     => rest,
+                 :benign_nodes    => spawn_nodes(current, :benign, state.beam_node_list),
+                 :malicious_nodes => spawn_nodes(@cfg.number_of_malicious_nodes, :malicious, state.beam_node_list)
+                }}
+  end
+
+  def handle_cast(:info, state) do
+    IO.puts "Process running: #{Process.list |> Enum.count}"
+    foo = state.sup_pid
+    |> DynamicSupervisor.which_children()
+    |> Enum.count
+
+    IO.puts "info #{inspect foo}"
+    mem_usage_wo = 17992568
+
+    mem_diff = :erlang.memory(:total) - mem_usage_wo
+    mem_diff_hr = div(mem_diff, 1024*1024)
+    IO.puts "mem: #{inspect mem_diff} (#{inspect mem_diff_hr})"
+
+    {:noreply, state}
+  end
+
+
+  def spawn_nodes(n, type, beam_node_list), do: spawn_nodes(n, type, [], beam_node_list)
+  def spawn_nodes(0, _type, node_list, _beam_node_list), do: node_list
+  def spawn_nodes(n, type, node_list, []) do
+    ## Generate a new node ID
+    node_id     = Utils.gen_node_id()
+    node_id_enc = node_id |> Base.encode16()
+    delay       = :rand.uniform(60000*3)
+
+    # Logger.error "Node-ID: #{node_id_enc}"
+    # Logger.error "Delay:   #{delay}"
+
+    # Start the main supervisor for the dht node
+    {:ok, pid} = DynamicSupervisor.start_child(Simulator.Supervisor,
+      {MlDHT.Supervisor,
+       node_id: node_id,
+       delay:   delay,
+       name:    MlDHT.Registry.via(node_id_enc, MlDHT.Supervisor)
+      })
+
+    spawn_nodes(n-1, type, node_list ++ [{pid, node_id}], [])
+  end
+  def spawn_nodes(n, type, node_list, [remote_node | beam_node_list]) do
+    ## Generate a new node ID
+    node_id     = Utils.gen_node_id()
+    node_id_enc = node_id |> Base.encode16()
+    delay       = :rand.uniform(60000*3)
+
+    Logger.error "REMOTE NODE #{inspect remote_node}"
+    Logger.error "Node-ID: #{node_id_enc}"
+    Logger.error "Delay:   #{delay}"
+
+    args = [
+      node_id: node_id,
+      delay:   delay,
+      name:    MlDHT.Registry.via(node_id_enc, MlDHT.Supervisor)
+    ]
+
+    bs_node = Application.get_env(:mldht, :bootstrap_nodes)
+
+    # Start the main supervisor for the dht node
+    {:ok, pid} = DynamicSupervisor.start_child(Simulator.Supervisor,
+      {MlDHT.Supervisor,
+       node_id: node_id,
+       delay:   delay,
+       name:    MlDHT.Registry.via(node_id_enc, MlDHT.Supervisor)
+      })
+
+    # pid = :rpc.call(:bar@ubuntu, Client, :start, [args, bs_node])
+    # Logger.error "remote pid: #{inspect pid}"
+    # Process.monitor(pid)
+
+    spawn_nodes(n-1, type, node_list ++ [{pid, node_id}], beam_node_list)
+  end
+
+  def generate_filename(dir, name) do
+    date = Date.utc_today() |> Date.to_string()
+    time = Time.utc_now |> Time.to_string()
+
+    "#{dir}/#{date}-#{name}/#{time}-results.csv"
+  end
+
+end
